@@ -4,6 +4,7 @@
 #   1. 把本文件和 config/firmware-packages.config 放到一个 GitHub 仓库（称为"配置仓库"）
 #   2. 在该仓库 Actions 页面手动运行 "Build RTL9617C OpenWrt Firmware"
 #   3. source_repo / source_ref 可指定任意 OpenWrt 源码仓库和分支（默认 lyq1996/rtl9617c-openwrt@refactor）
+#   4. 仅手动触发（workflow_dispatch），push / 定时等事件不会启动编译
 #
 # 行为约定：
 #   - 源码：由 source_repo + source_ref 决定，检出到 source/ 目录
@@ -46,12 +47,6 @@ on:
         required: false
         default: ""
         type: string
-  push:
-    branches:
-      - "**"
-    paths:
-      - "config/firmware-packages.config"
-      - ".github/workflows/build-firmware.yml"
 
 permissions:
   contents: write
