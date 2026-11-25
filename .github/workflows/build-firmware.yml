@@ -1,12 +1,14 @@
 # RTL9617C OpenWrt 固件自动编译
 #
 # 使用方法：
-#   1. 将本文件放到 rtl9617c-openwrt 仓库根目录的 .github/workflows/ 下
-#   2. 在 GitHub 仓库的 Actions 页面手动运行 "Build RTL9617C OpenWrt Firmware"
-#   3. 软件包在 config/firmware-packages.config 中增删，或在触发时填写 extra_packages
+#   1. 把本文件和 config/firmware-packages.config 放到一个 GitHub 仓库（称为"配置仓库"）
+#   2. 在该仓库 Actions 页面手动运行 "Build RTL9617C OpenWrt Firmware"
+#   3. source_repo / source_ref 可指定任意 OpenWrt 源码仓库和分支（默认 lyq1996/rtl9617c-openwrt@refactor）
 #
 # 行为约定：
-#   - 目标：rtl9617c / generic
+#   - 源码：由 source_repo + source_ref 决定，检出到 source/ 目录
+#   - 配置：始终从"运行工作流的仓库"读取 config/firmware-packages.config
+#   - 目标：rtl9617c / generic（设备由 device 参数选择）
 #   - LuCI 主题：仅 luci-theme-bootstrap（工作流会移除设备 profile 中硬编码的 argon）
 #   - 必备组件：luci-proto-wireguard、wireguard-tools、kmod-wireguard
 #   - 设备专属的 PON 控制等 DEVICE_PACKAGES 保持原样，固件才能正常使用
@@ -16,6 +18,16 @@ name: Build RTL9617C OpenWrt Firmware
 on:
   workflow_dispatch:
     inputs:
+      source_repo:
+        description: "OpenWrt 源码仓库（owner/repo，也支持 GitHub URL；默认 lyq1996/rtl9617c-openwrt）"
+        required: false
+        default: "lyq1996/rtl9617c-openwrt"
+        type: string
+      source_ref:
+        description: "源码分支 / 标签 / 提交（留空用该仓库默认分支，默认 refactor）"
+        required: false
+        default: "refactor"
+        type: string
       device:
         description: "目标设备"
         required: true
@@ -36,18 +48,13 @@ on:
         type: string
   push:
     branches:
-      - refactor
+      - "**"
     paths:
       - "config/firmware-packages.config"
-      - "target/linux/rtl9617c/**"
       - ".github/workflows/build-firmware.yml"
 
 permissions:
   contents: write
-
-concurrency:
-  group: rtl9617c-firmware-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   DEVICE: ${{ inputs.device || 'tianyi_tyfza1_2p5g' }}
@@ -60,10 +67,59 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 检出源码
+      - name: 解析源码仓库地址
+        id: repo
+        env:
+          INPUT_REPO: ${{ inputs.source_repo }}
+        run: |
+          set -euo pipefail
+          repo="$INPUT_REPO"
+          [ -n "$repo" ] || repo="lyq1996/rtl9617c-openwrt"
+          case "$repo" in
+            https://*|http://*|git://*)
+              repo="${repo#*://}"
+              repo="${repo#*/}"
+              repo="${repo%.git}"
+              ;;
+            git@*:*)
+              repo="${repo#*:}"
+              repo="${repo%.git}"
+              ;;
+          esac
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "源码仓库: $repo"
+          echo "源码引用: ${{ inputs.source_ref || '(默认分支)' }}"
+
+      - name: 检出构建配置（当前仓库）
         uses: actions/checkout@v4
         with:
+          path: build-config
           fetch-depth: 1
+          sparse-checkout: |
+            config
+            .github/workflows
+          sparse-checkout-cone-mode: false
+
+      - name: 检出 OpenWrt 源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.repo.outputs.repo }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          fetch-depth: 1
+
+      - name: 准备软件包配置
+        run: |
+          set -euo pipefail
+          if [ -f build-config/config/firmware-packages.config ]; then
+            cp -f build-config/config/firmware-packages.config source/config/firmware-packages.config
+            echo "使用配置仓库中的 config/firmware-packages.config"
+          elif [ -f source/config/firmware-packages.config ]; then
+            echo "配置文件不在配置仓库中，使用源码仓库自带的 config/firmware-packages.config"
+          else
+            echo "错误：找不到 config/firmware-packages.config" >&2
+            exit 1
+          fi
 
       - name: 释放 Runner 磁盘空间
         run: |
@@ -84,6 +140,7 @@ jobs:
           gcc --version | head -1
 
       - name: 更新并安装 feeds
+        working-directory: source
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -95,6 +152,7 @@ jobs:
           ./scripts/feeds install -a
 
       - name: 锁定 LuCI 主题为 bootstrap
+        working-directory: source
         run: |
           set -euo pipefail
           # 设备 profile 默认硬编码 luci-theme-argon；这里统一替换成 bootstrap，
@@ -104,6 +162,7 @@ jobs:
           grep -n 'DEVICE_PACKAGES' target/linux/rtl9617c/image/Makefile
 
       - name: 生成 .config
+        working-directory: source
         env:
           EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
@@ -125,6 +184,7 @@ jobs:
           grep -E '^CONFIG_(TARGET_DEVICE_rtl9617c|PACKAGE_luci-theme|PACKAGE_luci-proto-wireguard|PACKAGE_wireguard-tools|PACKAGE_kmod-wireguard)' .config
 
       - name: 最终锁定主题与 WireGuard 配置
+        working-directory: source
         run: |
           set -euo pipefail
           # defconfig 可能按 DEVICE_PACKAGES 的默认值把 argon 重新打开，这里再强制关闭一次
@@ -140,6 +200,7 @@ jobs:
           grep -E '^CONFIG_PACKAGE_(luci-theme|luci-proto-wireguard|wireguard-tools|kmod-wireguard)' .config
 
       - name: 预下载源码包
+        working-directory: source
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -150,6 +211,7 @@ jobs:
           done
 
       - name: 编译固件
+        working-directory: source
         run: |
           set -euo pipefail
           if ! make -j"$(nproc)"; then
@@ -158,6 +220,7 @@ jobs:
           fi
 
       - name: 收集固件产物
+        working-directory: source
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -172,7 +235,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rtl9617c-${{ env.DEVICE }}
-          path: artifacts/*
+          path: source/artifacts/*
           if-no-files-found: error
           retention-days: 30
 
@@ -182,7 +245,7 @@ jobs:
         with:
           tag_name: ${{ inputs.release_tag }}
           name: ${{ inputs.release_tag }}
-          files: artifacts/*
+          files: source/artifacts/*
 
       - name: 构建摘要
         if: always()
@@ -190,13 +253,14 @@ jobs:
           {
             echo "### RTL9617C 固件构建"
             echo ""
+            echo "- 源码仓库：\`${{ steps.repo.outputs.repo }}@${{ inputs.source_ref || '默认分支' }}\`"
             echo "- 设备：\`${DEVICE}\`"
             echo "- LuCI 主题：\`luci-theme-bootstrap\`"
             echo "- WireGuard：\`luci-proto-wireguard\` + \`wireguard-tools\` + \`kmod-wireguard\`"
-            echo "- 软件包配置来源：\`config/firmware-packages.config\`"
+            echo "- 软件包配置来源：\`config/firmware-packages.config\`（运行工作流的仓库）"
             echo ""
             echo "产物列表："
             echo '```'
-            ls -1 artifacts 2>/dev/null || true
+            ls -1 source/artifacts 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
