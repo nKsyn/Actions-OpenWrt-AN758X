@@ -13,6 +13,7 @@
 #   - LuCI 主题：仅 luci-theme-bootstrap（工作流会移除设备 profile 中硬编码的 argon）
 #   - 必备组件：luci-proto-wireguard、wireguard-tools、kmod-wireguard
 #   - 设备专属的 PON 控制等 DEVICE_PACKAGES 保持原样，固件才能正常使用
+#   - PON 控制包含 Rust 组件，工作流会安装 aarch64-unknown-linux-musl 交叉目标
 
 name: Build RTL9617C OpenWrt Firmware
 
@@ -133,6 +134,23 @@ jobs:
             qemu-utils uuid-dev
           python3 --version
           gcc --version | head -1
+
+      - name: 安装 Rust 交叉编译目标
+        run: |
+          set -euo pipefail
+          # rtl9617c-pon-control 的 OMCI 组件用 cargo 交叉编译到 aarch64-unknown-linux-musl，
+          # GitHub Runner 预装 rustup，但默认没有装 musl 目标，需要显式添加。
+          if [ -x "$HOME/.cargo/bin/rustup" ]; then
+            RUSTUP="$HOME/.cargo/bin/rustup"
+          elif command -v rustup >/dev/null 2>&1; then
+            RUSTUP=rustup
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            RUSTUP="$HOME/.cargo/bin/rustup"
+          fi
+          "$RUSTUP" target add aarch64-unknown-linux-musl
+          "$RUSTUP" target list --installed
+          "$HOME/.cargo/bin/rustc" --version
 
       - name: 更新并安装 feeds
         working-directory: source
