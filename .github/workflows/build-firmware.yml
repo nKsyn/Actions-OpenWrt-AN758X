@@ -182,16 +182,25 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
-          # defconfig 可能按 DEVICE_PACKAGES 的默认值把 argon 重新打开，这里再强制关闭一次
-          ./scripts/config \
-            -e PACKAGE_luci-theme-bootstrap \
-            -e PACKAGE_luci-proto-wireguard \
-            -e PACKAGE_wireguard-tools \
-            -e PACKAGE_kmod-wireguard \
-            -d PACKAGE_luci-theme-argon \
-            -d PACKAGE_luci-theme-material \
-            -d PACKAGE_luci-theme-design \
-            -d PACKAGE_luci-theme-openwrt
+          # OpenWrt 的 scripts/config 是 kconfig 工具源码目录，不是可执行文件。
+          # defconfig 可能按 DEVICE_PACKAGES 默认值重新打开 argon，这里直接改写 .config。
+          for sym in \
+            PACKAGE_luci-theme-bootstrap PACKAGE_luci-proto-wireguard \
+            PACKAGE_wireguard-tools PACKAGE_kmod-wireguard \
+            PACKAGE_luci-theme-argon PACKAGE_luci-theme-material \
+            PACKAGE_luci-theme-design PACKAGE_luci-theme-openwrt; do
+            sed -i -E "/^(# )?CONFIG_${sym}(=.*| is not set)$/d" .config
+          done
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_luci-proto-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+          CONFIG_PACKAGE_kmod-wireguard=y
+          # CONFIG_PACKAGE_luci-theme-argon is not set
+          # CONFIG_PACKAGE_luci-theme-material is not set
+          # CONFIG_PACKAGE_luci-theme-design is not set
+          # CONFIG_PACKAGE_luci-theme-openwrt is not set
+          EOF
           grep -E '^CONFIG_PACKAGE_(luci-theme|luci-proto-wireguard|wireguard-tools|kmod-wireguard)' .config
 
       - name: 预下载源码包
