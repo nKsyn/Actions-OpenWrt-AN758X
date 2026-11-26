@@ -177,13 +177,24 @@ jobs:
       - name: 生成 .config
         working-directory: source
         env:
+          DEVICE: ${{ inputs.device || 'tianyi_tyfza1_2p5g' }}
           EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
           set -euo pipefail
+          echo "参数中的设备：${DEVICE}"
+          # 必须显式关闭其它设备，否则 OpenWrt 的 defconfig 会按 default 把多个 profile 都打开，
+          # 结果可能编出 youhua 的固件。这里只保留 DEVICE 指定的那一个。
+          ALL_DEVICES="tianyi_tyfza1_2p5g youhua_pt1500_h10_2p5g"
           {
             echo "CONFIG_TARGET_rtl9617c=y"
             echo "CONFIG_TARGET_rtl9617c_generic=y"
-            echo "CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_${DEVICE}=y"
+            for d in $ALL_DEVICES; do
+              if [ "$d" = "$DEVICE" ]; then
+                echo "CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_${d}=y"
+              else
+                echo "# CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_${d} is not set"
+              fi
+            done
           } > .config
           cat config/firmware-packages.config >> .config
           if [ -n "${EXTRA_PACKAGES:-}" ]; then
@@ -195,6 +206,18 @@ jobs:
           make defconfig
           echo "----- 关键配置检查 -----"
           grep -E '^CONFIG_(TARGET_DEVICE_rtl9617c|PACKAGE_luci-theme|PACKAGE_luci-proto-wireguard|PACKAGE_wireguard-tools|PACKAGE_kmod-wireguard)' .config
+          echo "----- 设备选择校验 -----"
+          grep '^CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_' .config || true
+          selected=$(grep -c '^CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_.*=y' .config || true)
+          if [ "$selected" -ne 1 ]; then
+            echo "错误：期望只选中 1 个设备，实际选中 ${selected} 个" >&2
+            exit 1
+          fi
+          if ! grep -q "^CONFIG_TARGET_DEVICE_rtl9617c_generic_DEVICE_${DEVICE}=y" .config; then
+            echo "错误：选中的设备不是 ${DEVICE}，请检查 device 参数" >&2
+            exit 1
+          fi
+          echo "已确认目标设备：${DEVICE}"
 
       - name: 最终锁定主题与 WireGuard 配置
         working-directory: source
