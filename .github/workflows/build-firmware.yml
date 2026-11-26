@@ -164,6 +164,45 @@ jobs:
           done
           ./scripts/feeds install -a
 
+      - name: 防火墙页面加入 FullCone 开关
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # 给 LuCI 防火墙「常规设置」加 FullCone NAT / FullCone NAT (IPv6) 两个复选框，
+          # 对应 firewall4 补丁里的 defaults.fullcone / defaults.fullcone6。
+          FILE="feeds/luci/applications/luci-app-firewall/htdocs/luci-static/resources/view/firewall/zones.js"
+          [ -f "$FILE" ] || { echo "错误：找不到 $FILE" >&2; exit 1; }
+          python3 - "$FILE" <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          s = p.read_text(encoding='utf-8')
+          if 'form.Flag, \'fullcone\'' in s:
+              print('FullCone 开关已存在，跳过')
+              sys.exit(0)
+          anchor = "\t\to = s.option(form.Flag, 'drop_invalid', _('Drop invalid packets'));"
+          if s.count(anchor) != 1:
+              print('错误：找不到唯一的注入锚点，LuCI 版本可能不兼容' , file=sys.stderr)
+              sys.exit(1)
+          lines = [
+              '',
+              '\t\t/* FullCone NAT switch (added by firmware build) */',
+              '\t\tif (fw4) {',
+              '\t\t\to = s.option(form.Flag, \'fullcone\', _(\'FullCone NAT (IPv4)\'),',
+              '\t\t\t\t_(\'Enable FullCone NAT for IPv4 masquerade. Requires kmod-nft-fullcone.\'));',
+              '\t\t\to.default = false;',
+              '\t\t\to = s.option(form.Flag, \'fullcone6\', _(\'FullCone NAT (IPv6)\'),',
+              '\t\t\t\t_(\'Enable FullCone NAT for IPv6 masquerade. Usually not needed.\'));',
+              '\t\t\to.default = false;',
+              '\t\t}',
+              '',
+          ]
+          add = '\n'.join(lines)
+          p.write_text(s.replace(anchor, anchor + add, 1), encoding='utf-8')
+          print('已注入 FullCone 开关')
+          PY
+          grep -n "fullcone" "$FILE"
+
       - name: 锁定 LuCI 主题为 bootstrap
         working-directory: source
         run: |
@@ -183,11 +222,21 @@ jobs:
           set -euo pipefail
           echo "参数中的设备：${DEVICE}"
 
-          # 第一步：写入目标板 + 软件包，先做一次 defconfig 生成完整的 Kconfig 定义，
-          # 这样可以从 tmp/.config-target.in 中读出本版本真实的设备符号名。
+          # 只做一次 defconfig：device profile 的 DEVICE_PACKAGES（含 WiFi 驱动）依赖
+          # Kconfig 的 DEFAULT_* select，必须在同一个 .config 里一次算完。若先 defconfig
+          # 再改设备并二次 defconfig，第一次留下的 "is not set" 会覆盖新设备的包选中，
+          # 结果就是固件没有无线。
+          ALL_DEVICES="tianyi_tyfza1_2p5g youhua_pt1500_h10_2p5g"
           {
             echo "CONFIG_TARGET_rtl9617c=y"
             echo "CONFIG_TARGET_rtl9617c_generic=y"
+            for d in $ALL_DEVICES; do
+              if [ "$d" = "$DEVICE" ]; then
+                echo "CONFIG_TARGET_rtl9617c_generic_DEVICE_${d}=y"
+              else
+                echo "# CONFIG_TARGET_rtl9617c_generic_DEVICE_${d} is not set"
+              fi
+            done
           } > .config
           cat config/firmware-packages.config >> .config
           if [ -n "${EXTRA_PACKAGES:-}" ]; then
@@ -198,44 +247,27 @@ jobs:
           fi
           make defconfig
 
-          # 第二步：从生成的配置里找出指向目标设备的 profile 符号（形如
-          # CONFIG_TARGET_..._DEVICE_<设备名>=y 或 ... is not set）。
-          # OpenWrt 各版本符号前缀不同，这里不硬编码，直接按 <设备名> 匹配。
-          echo "----- 源码中的设备 profile 符号 -----"
-          grep -E 'CONFIG_TARGET_.*DEVICE_.*(tianyi|youhua)' .config || true
-          target_sym=$(grep -oE 'CONFIG_TARGET_[A-Za-z0-9_]*DEVICE_'"${DEVICE}"'=y' .config | head -1 || true)
-          if [ -z "$target_sym" ]; then
-            # 当前设备还是 "is not set" 形式，从注释行提取符号名
-            target_sym=$(grep -oE '# CONFIG_TARGET_[A-Za-z0-9_]*DEVICE_'"${DEVICE}"' is not set' .config \
-                         | head -1 | sed -E 's/^# (.*) is not set$/\1/' || true)
-          fi
-          if [ -z "$target_sym" ]; then
-            echo "错误：源码中找不到设备 ${DEVICE} 的 profile 符号，请检查 device 参数或源码版本" >&2
-            grep -E 'DEVICE_' .config >&2 || true
-            exit 1
-          fi
-          target_sym="${target_sym%=y}"
-
-          # 第三步：显式只选中目标设备，关闭另一个设备（避免 defconfig 回落到默认 youhua）。
-          # 设备符号可能是 =y 或 "is not set" 两种形式，都转成 is not set 后再打开目标。
-          for sym in $(grep -oE 'CONFIG_TARGET_[A-Za-z0-9_]*DEVICE_(tianyi_tyfza1_2p5g|youhua_pt1500_h10_2p5g)' .config | sort -u); do
-            sed -i -E "s/^${sym}=y$/# ${sym} is not set/" .config
-            sed -i -E "s/^# ${sym} is not set$/# ${sym} is not set/" .config
-          done
-          sed -i -E "s/^# ${target_sym} is not set$/${target_sym}=y/" .config
-          grep -q "^${target_sym}=y$" .config || echo "${target_sym}=y" >> .config
-          make defconfig
-
           echo "----- 关键配置检查 -----"
-          grep -E '^CONFIG_(TARGET_.*DEVICE_.*=y|PACKAGE_luci-theme|PACKAGE_luci-proto-wireguard|PACKAGE_wireguard-tools|PACKAGE_kmod-wireguard)' .config || true
+          grep -E '^CONFIG_(TARGET_rtl9617c_generic_DEVICE_|PACKAGE_luci-theme|PACKAGE_luci-proto-wireguard|PACKAGE_wireguard-tools|PACKAGE_kmod-wireguard)' .config || true
           echo "----- 设备选择校验 -----"
-          selected=$(grep -c '^CONFIG_TARGET_.*DEVICE_.*=y' .config || true)
+          target_sym="CONFIG_TARGET_rtl9617c_generic_DEVICE_${DEVICE}"
+          selected=$(grep -c '^CONFIG_TARGET_rtl9617c_generic_DEVICE_.*=y' .config || true)
           if [ "$selected" -ne 1 ] || ! grep -q "^${target_sym}=y$" .config; then
             echo "错误：期望只选中 ${DEVICE}（${target_sym}），实际选中 ${selected} 个设备" >&2
+            echo "当前 .config 中的设备符号：" >&2
             grep -E 'CONFIG_TARGET_.*DEVICE_' .config >&2 || true
             exit 1
           fi
           echo "已确认目标设备：${DEVICE}（${target_sym}=y）"
+
+          # 无线驱动兜底校验：选中 TYFZA1 时必须带上 WiFi 驱动与固件
+          if [ "$DEVICE" = "tianyi_tyfza1_2p5g" ]; then
+            for p in kmod-rtw89-8852ce rtl8852ce-ap-firmware wpad-basic-mbedtls; do
+              if ! grep -q "^CONFIG_PACKAGE_${p}=y$" .config; then
+                echo "警告：${p} 未选中，固件可能没有无线功能" >&2
+              fi
+            done
+          fi
 
       - name: 最终锁定主题与 WireGuard 配置
         working-directory: source
